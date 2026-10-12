@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QButtonGroup, QToolButton, QFrame,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize
-from PyQt6.QtGui import QPixmap, QIcon, QPainter, QFont, QBrush, QColor
+from PyQt6.QtGui import QPixmap, QIcon, QPainter, QFont, QFontMetrics, QBrush, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from dict_anki import (
@@ -140,6 +140,45 @@ def _primary(btn: QPushButton) -> QPushButton:
     return btn
 
 
+class _AutoFitLabel(QLabel):
+    """Bold single-line label that shrinks its font to fit the available width.
+    Wraps only if the text still doesn't fit at the minimum size."""
+
+    def __init__(self, text: str, max_px: int = 15, min_px: int = 9, parent=None):
+        super().__init__(text, parent)
+        self._max_px = max_px
+        self._min_px = min_px
+        f = self.font()
+        f.setBold(True)
+        f.setPixelSize(max_px)
+        self.setFont(f)
+        self.setToolTip(text)
+        # Don't let the text's natural width force the window wider.
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def _fit(self):
+        avail = self.contentsRect().width()
+        if avail <= 0:
+            return
+        f  = QFont(self.font())
+        px = self._max_px
+        while px > self._min_px:
+            f.setPixelSize(px)
+            if QFontMetrics(f).horizontalAdvance(self.text()) <= avail:
+                break
+            px -= 1
+        f.setPixelSize(px)
+        if f != self.font():
+            self.setFont(f)
+        wrap = QFontMetrics(f).horizontalAdvance(self.text()) > avail
+        if wrap != self.wordWrap():
+            self.setWordWrap(wrap)
+
+
 def _audio_filename_for(text: str) -> str:
     """Deterministic filename: google-{sha1_in_5_groups}.mp3 (same format as HyperTTS)."""
     spoken = text.replace(" | ", ", ")
@@ -244,8 +283,8 @@ class PreviewDialog(QDialog):
         vbox.setSpacing(12)
         vbox.setContentsMargins(18, 18, 18, 18)
 
-        hdr = QLabel(self.pairs[0]["german"] if self.pairs else "")
-        hdr.setStyleSheet("font-size: 15px; font-weight: bold; color: #9cdcfe;")
+        hdr = _AutoFitLabel(self.pairs[0]["german"] if self.pairs else "", max_px=15)
+        hdr.setStyleSheet("color: #9cdcfe;")
         vbox.addWidget(hdr)
 
         # ── Image picker ─────────────────────────────────────────────────
@@ -319,12 +358,13 @@ class PreviewDialog(QDialog):
         prev_vbox.setSpacing(8)
 
         if len(self.pairs) == 1:
+            english = self.pairs[0]["english"]
             cards_lbl = QLabel(
                 f"<b style='color:#9cdcfe'>{self.pairs[0]['german']}</b>"
-                f"  →  {self.pairs[0]['english']}"
+                + (f"  →  {english}" if english else "")
             )
         else:
-            lines = "  |  ".join(f"<b>{p['english']}</b>" for p in self.pairs)
+            lines = "  |  ".join(f"<b>{p['english']}</b>" for p in self.pairs if p["english"])
             cards_lbl = QLabel(f"{len(self.pairs)} cards: {lines}")
         cards_lbl.setWordWrap(True)
         prev_vbox.addWidget(cards_lbl)
@@ -458,7 +498,7 @@ class PreviewDialog(QDialog):
         if mapping == "English translation":
             if len(self.pairs) == 1:
                 return self.pairs[0]["english"]
-            return " / ".join(p["english"] for p in self.pairs)
+            return " / ".join(p["english"] for p in self.pairs if p["english"])
         if mapping == "Image":
             ref = self._img_ref()
             return ref if ref else "(no image selected)"
@@ -822,14 +862,24 @@ class MainWindow(QMainWindow):
     # ── Preview ───────────────────────────────────────────────────────────
 
     def _open_preview(self):
-        selected = []
+        word_infos, translations = [], []
         for i in range(self.results_list.count()):
             item = self.results_list.item(i)
             stored = item.data(Qt.ItemDataRole.UserRole)
             if stored and item.checkState() == Qt.CheckState.Checked:
-                selected.append({"german": stored["german"], "english": stored["english"]})
-        if not selected:
+                if stored["result_idx"] is None:
+                    word_infos.append(stored)
+                else:
+                    translations.append(stored)
+        if not word_infos and not translations:
             return
+
+        if word_infos:
+            # Word info supplies the German side; checked translations supply the English.
+            english  = " / ".join(t["english"] for t in translations if t["english"])
+            selected = [{"german": word_infos[0]["german"], "english": english}]
+        else:
+            selected = [{"german": t["german"], "english": t["english"]} for t in translations]
 
         deck    = self.deck_combo.currentText()
         model   = self.model_combo.currentText()

@@ -12,10 +12,13 @@ thumbnails for selection, and adds the finished card to Anki via AnkiConnect.
 dict-anki/
 ├── app.py           # PyQt6 GUI — all UI, workers, dialogs
 ├── dict_anki.py     # Backend — scraping, API calls, formatting
-├── dict-anki        # Executable launcher (bash script, chmod +x)
+├── dict-anki        # Linux launcher (bash script, chmod +x)
+├── build.ps1        # Windows build script → dist\dict-anki.exe
 ├── requirements.txt # pip dependencies
 ├── CONTEXT.md       # this file
-└── venv/            # Python virtualenv
+├── .gitignore       # ignores venv/, build/, dist/, *.spec, icon.ico
+├── dist/            # (generated) dict-anki.exe — double-click to run
+└── venv/            # Python virtualenv (Linux; empty on the Windows machine)
 ```
 
 ---
@@ -53,6 +56,7 @@ Single entry point for a dict.cc lookup. Returns:
 ```python
 {
   "results":    [...],   # list of {german_word, english, gender, entry_id}
+  "word_info":  [...],   # list of {type, content} — NOUN/VERB/SYNO/ALSO/… rows
   "images":     [...],   # list of {id, description, url}
   "audio_id":   int|None,
   "audio_word": str,     # the original search term
@@ -68,6 +72,12 @@ Single entry point for a dict.cc lookup. Returns:
 - Skips entries ending with `-` (compound prefix forms like "Schreibtisch-")
 - Sorts: exact match first, then nouns, then others
 
+#### `_extract_word_info(html) → list[dict]`
+Parses dict.cc's word-info rows (`NOUN`, `VERB`, `ADJ`, `SYNO`, `ALSO`, …) — `<tr>`
+elements with no `id` and an unclassed first `<td>`. Numbered labels collapse
+(`NOUN1` → `NOUN`); hidden content (`display:none`) and `javascript:` expand
+links are stripped. `content` is the German text, e.g. `der Tisch | die Tische`.
+
 #### `_extract_images(html) → list[dict]`
 Parses the `display_shutterstock_images_multi("word","de",[...])` JS call.
 Each image has `{id, description, url}`.
@@ -78,7 +88,8 @@ Finds the dict.cc entry ID (from `idArr`) for the exact German word match in
 generated via gTTS (see `tts_audio`).
 
 #### `get_plural(word) → str|None`
-Calls `en.wiktionary.org/w/api.php` with `action=parse&prop=text` to get
+**Currently unused by the GUI** (plurals now come from the dict.cc NOUN word-info
+row instead). Calls `en.wiktionary.org/w/api.php` with `action=parse&prop=text` to get
 rendered HTML, finds the `inflection-table-de` table, reads the Nominative
 row at column index 5 (plural nominative).
 
@@ -128,7 +139,6 @@ All network/blocking work is off the main thread via `QThread` subclasses:
 | Worker | Input | Output (signal) | Blocking call |
 |---|---|---|---|
 | `SearchWorker` | search word | `finished(dict)` | `fetch_search()` — dict.cc scrape |
-| `PluralWorker` | list of raw results | `updated(int, str)` per noun | `get_plural()` — Wiktionary, one call per unique noun |
 | `ThumbnailLoader` | list of image dicts | `ready(int, QPixmap, bytes)` per image | HTTP GET for each thumbnail |
 | `AudioWorker` | formatted German string | `ready(bytes)` | `tts_audio()` — gTTS network call |
 
@@ -138,27 +148,27 @@ All network/blocking work is off the main thread via `QThread` subclasses:
 User types ≥2 chars
   → 600ms QTimer debounce
   → SearchWorker starts (fetches dict.cc only — no Wiktionary)
-  → results appear immediately, grouped into sections
-  → PluralWorker starts in background
-  → as plurals arrive: each list item updates "der Tisch" → "der Tisch | die Tische"
+  → results appear immediately in two sections
 ```
 
-### Results grouping
+### Results list
 
-`_categorize_results(results)` splits the raw results list into:
-- **Nouns** — single-word entries with a gender marker (m/f/n/pl)
-- **Other** — single-word entries without gender (verbs, adjectives)
-- **N Words** — multi-word phrases, bucketed by word count (2 Words, 3 Words, …)
+The single `QListWidget` holds two sections, each introduced by
+`_make_section_header(title)` (non-checkable, accent colour `#9cdcfe`, darker
+background):
 
-`_make_section_header(title)` creates a non-checkable, non-selectable
-`QListWidgetItem` styled in the accent colour (`#9cdcfe`) with a darker
-background, used as a visual divider between groups.
+1. **Word Info** — one checkable row per `word_info` entry, built by
+   `_make_word_info_item(label, content)`: monospace, yellow (`#dcdcaa`),
+   shown as `NOUN    der Tisch | die Tische`. Unchecked by default.
+2. **Translations** — one checkable row per result: `der Tisch  →  table`.
+   The first translation is pre-checked.
 
-Because section headers are interspersed among result items, list position
-no longer equals result array index. Each result item stores
-`{"german", "english", "result_idx"}` in `UserRole`. `_on_plural_updated`
-searches by `result_idx` instead of list position. Header items have
-`UserRole = None` and are skipped in all checkbox loops.
+Every checkable row stores `{"german", "english", "result_idx"}` in `UserRole`:
+- Word Info rows: `german = content`, `english = ""`, `result_idx = None`
+- Translation rows: `result_idx` = index into `results`
+
+`result_idx is None` is how the code tells Word Info rows from translations.
+Header items have `UserRole = None` and are skipped in all checkbox loops.
 
 ### Config persistence
 
@@ -176,17 +186,34 @@ searches by `result_idx` instead of list position. Header items have
 ### `MainWindow`
 
 - Live search: `textChanged → QTimer(600ms) → SearchWorker`
-- Results displayed in grouped sections (Nouns → Other → 2 Words → 3 Words …)
-- First item across all sections is pre-checked
+- Results displayed in two sections (Word Info → Translations)
+- First translation is pre-checked
 - **Preview** button (bottom-right) opens `PreviewDialog` for checked items
+
+#### How checked rows become cards (`_open_preview`)
+
+| Checked | Result |
+|---|---|
+| ≥1 Word Info row (+ any translations) | **One card.** German = first checked Word Info row's text; English = checked translations' English joined with ` / ` (empty if none) |
+| Translations only | **One card per translation** (German + English of each row) |
+
+Example: check `NOUN der Tisch | die Tische` + `der Tisch → table` →
+one card `der Tisch | die Tische` / `table`, and TTS speaks the Word Info text.
 
 ### `PreviewDialog`
 
-Opened with `pairs` (checked results), image list, and `audio_text` (the
-formatted German string of the first selected item).
+Opened with `pairs` (the cards built above), image list, and `audio_text`
+(the German of the first pair).
 
 Key behaviour:
 
+- **Header**: `_AutoFitLabel` showing the German text. It shrinks the bold font
+  from 15px down to 9px to fit the window width (re-fits on resize). Below 9px it
+  word-wraps. Horizontal size policy is `Ignored`, so a long word never forces the
+  dialog wider. Hovering shows the full text.
+- **Empty English values are skipped** wherever English is joined (field value,
+  card summary). Without this, a Word Info row's empty English produced a stray
+  ` / table`.
 - **On open**: `ThumbnailLoader` and `AudioWorker` start in parallel
 - **Auto-play**: audio plays automatically as soon as `AudioWorker` emits `ready`
 - **Editable fields**: each mapped field is a `QLineEdit` pre-filled with
@@ -249,12 +276,16 @@ venv/bin/pip install -r requirements.txt
 
 ### Run
 
+**Windows**: double-click `dist\dict-anki.exe` (build it first with `build.ps1`,
+see *Packaging → Windows*). From source: `python app.py`.
+
+**Linux**:
 ```bash
 ./dict-anki          # launcher script
 venv/bin/python app.py  # direct
 ```
 
-The app is registered at `~/.local/share/applications/dict-anki.desktop` and
+On Linux the app is registered at `~/.local/share/applications/dict-anki.desktop` and
 appears in the app launcher / taskbar search.
 
 To reinstall the desktop entry and icon after moving the project:
@@ -343,37 +374,35 @@ venv/bin/pyinstaller --name dict-anki --windowed --onefile \
 
 ### Windows
 
-Run on a **Windows machine** (cross-compilation is not supported by PyInstaller):
+Run on a **Windows machine** (cross-compilation is not supported by PyInstaller).
+`build.ps1` does everything:
 
 ```powershell
-python -m venv venv
-venv\Scripts\pip install -r requirements.txt
-venv\Scripts\pip install pyinstaller
-
-# Convert icon (requires ImageMagick)
-magick convert icon.png -resize 256x256 icon.ico
-
-venv\Scripts\pyinstaller `
-    --name dict-anki `
-    --windowed `
-    --onedir `
-    --icon icon.ico `
-    --collect-all PyQt6 `
-    --hidden-import gtts `
-    app.py
+pip install -r requirements.txt pyinstaller   # once
+powershell -ExecutionPolicy Bypass -File build.ps1
+# Output: dist\dict-anki.exe  (single file, ~50 MB) — double-click to run
 ```
+
+What `build.ps1` does:
+1. Renders `icon.ico` by calling `app._render_icon_pixmap(256)` under
+   `QT_QPA_PLATFORM=offscreen` (no ImageMagick needed). The exe icon matches the in-app icon.
+2. Runs `python -m PyInstaller --windowed --onefile --icon icon.ico --name dict-anki app.py`.
+
+Set `$env:PYTHON` to use a specific interpreter (default: `python` on PATH).
+Last built with Python 3.14.6, PyQt6 6.11.0, PyInstaller 6.22.3.
 
 **Notes:**
 - `--windowed` suppresses the console window
-- `--collect-all PyQt6` is needed for `QMediaPlayer` audio DLLs
+- `--onefile` gives one self-contained `.exe`. Copy or shortcut it anywhere.
+  Startup takes a few seconds because it unpacks to `%TEMP%` on each launch.
+  For faster startup, swap in `--onedir` and distribute the whole
+  `dist\dict-anki\` folder.
+- `--collect-all PyQt6` is **not** needed: PyInstaller's PyQt6 hooks already
+  bundle `plugins\multimedia\ffmpegmediaplugin.dll` + FFmpeg DLLs for `QMediaPlayer`
 - gTTS makes outbound HTTPS requests — Windows Defender may prompt on first run
-- Distribute the entire `dist\dict-anki\` folder, not just the `.exe`
-
-```
-dist\dict-anki\
-├── dict-anki.exe
-└── _internal\      # Qt DLLs, Python stdlib, site-packages
-```
+- Rebuild after every source change. The exe bundles a snapshot of the code.
+- `_install_app_icon()` still writes `~/.local/share/icons/...` on startup.
+  On Windows this does nothing useful but is harmless.
 
 ---
 
@@ -385,8 +414,9 @@ dist\dict-anki\
 | German vote count "6512" in word | `<div style="float:right">` inside `<td>` | All `<div>` children removed before `get_text()` |
 | Wiktionary returned empty | Missing `User-Agent` header | Added `headers={"User-Agent": "dict-anki/1.0"}` |
 | dict.cc audio broken / unreliable | URL pattern changed; content-type checks failed | Replaced entirely with gTTS; always generates audio from the formatted string |
-| Search slow | Wiktionary called serially for every noun before showing results | `SearchWorker` fetches dict.cc only; `PluralWorker` updates items in background |
-| Plural update lands on wrong row | Section headers interspersed in list shifted position-based index | Items store `result_idx` in UserRole; `_on_plural_updated` searches by it |
+| Search slow | Wiktionary called serially for every noun before showing results | `SearchWorker` fetches dict.cc only; Wiktionary lookup dropped (plural comes from the Word Info NOUN row) |
+| Extra ` / ` in preview English | Word Info rows carry `english = ""`, which was joined with the translation | Word Info + translations merge into one card; empty English values are skipped when joining |
+| Long German text overflowed preview | Fixed 15px header label | `_AutoFitLabel` shrinks font to fit, wraps below 9px |
 
 ---
 
