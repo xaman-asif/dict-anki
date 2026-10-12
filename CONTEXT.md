@@ -1,0 +1,400 @@
+# dict-anki — Project Context
+
+A PyQt6 desktop app that looks up German words on dict.cc, enriches them with
+Wiktionary plurals, generates TTS audio with gTTS, shows Shutterstock image
+thumbnails for selection, and adds the finished card to Anki via AnkiConnect.
+
+---
+
+## File Structure
+
+```
+dict-anki/
+├── app.py           # PyQt6 GUI — all UI, workers, dialogs
+├── dict_anki.py     # Backend — scraping, API calls, formatting
+├── dict-anki        # Executable launcher (bash script, chmod +x)
+├── requirements.txt # pip dependencies
+├── CONTEXT.md       # this file
+└── venv/            # Python virtualenv
+```
+
+---
+
+## Backend — `dict_anki.py`
+
+### External services
+
+| Service | Purpose | How accessed |
+|---|---|---|
+| dict.cc | German↔English translations, Shutterstock images | HTTP scraping via `requests` |
+| Wiktionary API | German noun plurals | `en.wiktionary.org/w/api.php` |
+| Google TTS (gTTS) | German pronunciation audio | `gtts` library (calls Google Translate TTS) |
+| AnkiConnect | Add notes, store media in Anki | HTTP POST to `localhost:8765` |
+
+### Key constants
+
+```python
+ANKI_URL    = "http://localhost:8765"
+CONFIG_PATH = Path.home() / ".dict_anki.json"   # persisted user settings
+DICT_CC_URL = "https://www.dict.cc/"
+GENDER_ARTICLE = {"m": "der", "f": "die", "n": "das"}
+```
+
+### Important functions
+
+#### `_get_session() → requests.Session`
+Returns a singleton `requests.Session` with browser-like headers. **Critical**: the
+session performs a warm-up GET to `https://www.dict.cc/` before the first search.
+Without this, dict.cc returns only a short "limited result set" (~3 entries) instead
+of the full 50+ rows.
+
+#### `fetch_search(word) → dict`
+Single entry point for a dict.cc lookup. Returns:
+```python
+{
+  "results":    [...],   # list of {german_word, english, gender, entry_id}
+  "images":     [...],   # list of {id, description, url}
+  "audio_id":   int|None,
+  "audio_word": str,     # the original search term
+}
+```
+
+#### `_parse_results(html, word) → list[dict]`
+- Finds `<tr id="trN">` rows from dict.cc HTML
+- Reads `c1Arr` JS array for clean English (avoids qualifier noise like
+  `{adj} [attr.] [e.g. chair, lamp]`)
+- Reads `idArr` JS array for entry IDs
+- Extracts gender from `{m}`, `{f}`, `{n}` markers in the German column
+- Skips entries ending with `-` (compound prefix forms like "Schreibtisch-")
+- Sorts: exact match first, then nouns, then others
+
+#### `_extract_images(html) → list[dict]`
+Parses the `display_shutterstock_images_multi("word","de",[...])` JS call.
+Each image has `{id, description, url}`.
+
+#### `_find_audio_id(html, word) → int|None`
+Finds the dict.cc entry ID (from `idArr`) for the exact German word match in
+`c2Arr`. Retained in the data but **not used for audio** — all audio is
+generated via gTTS (see `tts_audio`).
+
+#### `get_plural(word) → str|None`
+Calls `en.wiktionary.org/w/api.php` with `action=parse&prop=text` to get
+rendered HTML, finds the `inflection-table-de` table, reads the Nominative
+row at column index 5 (plural nominative).
+
+#### `format_german(word, gender, plural) → str`
+Produces the display string:
+- `"der Tisch | die Tische"` (noun with plural)
+- `"der Tisch"` (noun, no plural found yet)
+- `"die Tische"` (plural-only noun, gender=`"pl"`)
+- `"laufen"` (verb/adjective — no article)
+
+#### `tts_audio(text) → bytes|None`
+Generates MP3 audio via gTTS. Replaces ` | ` with `, ` so
+`"der Tisch | die Tische"` is spoken as `"der Tisch, die Tische"`.
+Returns raw MP3 bytes or `None` on failure. dict.cc audio was dropped in
+favour of this — gTTS speaks the full formatted string including the plural.
+
+#### `store_anki_media(filename, data) → str`
+Encodes bytes to base64 and calls AnkiConnect `storeMediaFile`.
+
+#### `anki(action, **params)`
+Generic AnkiConnect caller. Raises `RuntimeError` if AnkiConnect returns an error.
+
+---
+
+## Frontend — `app.py`
+
+### Dark theme
+
+Full VS Code-inspired dark theme applied via `app.setStyleSheet(APP_STYLE)`:
+
+| Role | Colour |
+|---|---|
+| Window / root background | `#1e1e1e` |
+| Panel / group box background | `#252526` |
+| Input / button background | `#3c3c3c` |
+| Section header background | `#1a1a1a` |
+| Primary text | `#d4d4d4` |
+| Accent / section header text | `#9cdcfe` |
+| Field value text (monospace) | `#ce9178` |
+| Accent button (Add to Anki) | `#0078d4` |
+| Selected list item | `#094771` |
+
+### Threading model
+
+All network/blocking work is off the main thread via `QThread` subclasses:
+
+| Worker | Input | Output (signal) | Blocking call |
+|---|---|---|---|
+| `SearchWorker` | search word | `finished(dict)` | `fetch_search()` — dict.cc scrape |
+| `PluralWorker` | list of raw results | `updated(int, str)` per noun | `get_plural()` — Wiktionary, one call per unique noun |
+| `ThumbnailLoader` | list of image dicts | `ready(int, QPixmap, bytes)` per image | HTTP GET for each thumbnail |
+| `AudioWorker` | formatted German string | `ready(bytes)` | `tts_audio()` — gTTS network call |
+
+### Search flow (live search)
+
+```
+User types ≥2 chars
+  → 600ms QTimer debounce
+  → SearchWorker starts (fetches dict.cc only — no Wiktionary)
+  → results appear immediately, grouped into sections
+  → PluralWorker starts in background
+  → as plurals arrive: each list item updates "der Tisch" → "der Tisch | die Tische"
+```
+
+### Results grouping
+
+`_categorize_results(results)` splits the raw results list into:
+- **Nouns** — single-word entries with a gender marker (m/f/n/pl)
+- **Other** — single-word entries without gender (verbs, adjectives)
+- **N Words** — multi-word phrases, bucketed by word count (2 Words, 3 Words, …)
+
+`_make_section_header(title)` creates a non-checkable, non-selectable
+`QListWidgetItem` styled in the accent colour (`#9cdcfe`) with a darker
+background, used as a visual divider between groups.
+
+Because section headers are interspersed among result items, list position
+no longer equals result array index. Each result item stores
+`{"german", "english", "result_idx"}` in `UserRole`. `_on_plural_updated`
+searches by `result_idx` instead of list position. Header items have
+`UserRole = None` and are skipped in all checkbox loops.
+
+### Config persistence
+
+`~/.dict_anki.json` stores last-used deck, model, and per-model field mappings:
+```json
+{
+  "deck": "German",
+  "model": "Basic",
+  "mappings": {
+    "Basic": {"Front": "German word", "Back": "English translation"}
+  }
+}
+```
+
+### `MainWindow`
+
+- Live search: `textChanged → QTimer(600ms) → SearchWorker`
+- Results displayed in grouped sections (Nouns → Other → 2 Words → 3 Words …)
+- First item across all sections is pre-checked
+- **Preview** button (bottom-right) opens `PreviewDialog` for checked items
+
+### `PreviewDialog`
+
+Opened with `pairs` (checked results), image list, and `audio_text` (the
+formatted German string of the first selected item).
+
+Key behaviour:
+
+- **On open**: `ThumbnailLoader` and `AudioWorker` start in parallel
+- **Auto-play**: audio plays automatically as soon as `AudioWorker` emits `ready`
+- **Editable fields**: each mapped field is a `QLineEdit` pre-filled with
+  the computed value:
+  - `_field_edits: dict[str, QLineEdit]` — the widgets
+  - `_field_dirty: set[str]` — fields the user has manually typed in
+  - `textEdited` signal (fires only on user input, not `setText`) adds to dirty set
+  - `_refresh_preview()` skips dirty fields, so auto-updates (audio loading,
+    image selection) never overwrite user edits
+- **German word field embeds audio**:
+  `der Tisch | die Tische [sound:google-XXXX-XXXX-XXXX-XXXX-XXXX.mp3]`
+- **Audio filename** (`_audio_filename_for(text)`):
+  `google-{sha1[:8]}-{sha1[8:16]}-{sha1[16:24]}-{sha1[24:32]}-{sha1[32:40]}.mp3`
+  where SHA-1 is computed on the spoken text (` | ` → `, `).
+  This matches the HyperTTS naming convention.
+- **On Add to Anki**:
+  - Stores image (if mapped) via `storeMediaFile`
+  - Stores audio (if any field maps to "German word" or "Audio") via `storeMediaFile`
+  - Single card: uses `QLineEdit` text verbatim for every field
+  - Multi-card: Image/Audio fields use `QLineEdit` text (shared); German/English
+    fall back to per-pair values
+
+### App icon
+
+`_render_icon_pixmap(size)` draws ♾ on a dark rounded rectangle using `QPainter`.
+`_install_app_icon(px)` saves it to
+`~/.local/share/icons/hicolor/256x256/apps/dict-anki.png` on every startup.
+Both `app` and `win` get `setWindowIcon()` so it appears in both the taskbar
+and the window title bar.
+
+### Desktop integration
+
+`~/.local/share/applications/dict-anki.desktop` is installed once (manually or
+by re-running the setup commands). The app sets:
+
+```python
+app.setApplicationName("dict-anki")
+app.setApplicationDisplayName("dict.cc → Anki")
+```
+
+so the WM_CLASS matches the `.desktop` file's `StartupWMClass=dict-anki`.
+
+---
+
+## Running the App
+
+### Requirements
+
+- Python 3.10+
+- Anki open with **AnkiConnect** add-on installed (code: `2055492159`)
+- Internet connection (dict.cc, Wiktionary, Google TTS)
+
+### First-time setup
+
+```bash
+cd /home/opi/Programming/dict-anki
+python -m venv venv
+venv/bin/pip install -r requirements.txt
+```
+
+### Run
+
+```bash
+./dict-anki          # launcher script
+venv/bin/python app.py  # direct
+```
+
+The app is registered at `~/.local/share/applications/dict-anki.desktop` and
+appears in the app launcher / taskbar search.
+
+To reinstall the desktop entry and icon after moving the project:
+
+```bash
+# regenerate icon PNG
+QT_QPA_PLATFORM=offscreen venv/bin/python -c "
+from PyQt6.QtWidgets import QApplication; from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap, QPainter, QFont, QBrush, QColor
+import pathlib, sys
+app = QApplication(sys.argv)
+size = 256; px = QPixmap(size, size); px.fill(Qt.GlobalColor.transparent)
+p = QPainter(px); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+p.setBrush(QBrush(QColor('#1e1e1e'))); p.setPen(Qt.PenStyle.NoPen)
+p.drawRoundedRect(0,0,size,size,size//5,size//5)
+p.setPen(QColor('#d4d4d4')); f=QFont(); f.setPixelSize(int(size*.72)); p.setFont(f)
+p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, '♾'); p.end()
+d = pathlib.Path.home()/'.local/share/icons/hicolor/256x256/apps'
+d.mkdir(parents=True, exist_ok=True); px.save(str(d/'dict-anki.png'), 'PNG')
+"
+# reinstall .desktop
+cat > ~/.local/share/applications/dict-anki.desktop << 'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=dict.cc → Anki
+Comment=German flashcard creator using dict.cc
+Exec=/home/opi/Programming/dict-anki/dict-anki
+Icon=dict-anki
+Terminal=false
+Categories=Education;Languages;
+StartupNotify=true
+StartupWMClass=dict-anki
+EOF
+update-desktop-database ~/.local/share/applications/
+```
+
+---
+
+## Packaging as Executable
+
+### Linux
+
+#### Option A — Current approach (venv + shell script)
+The `dict-anki` launcher script already works as an executable:
+```bash
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/app.py" "$@"
+```
+**Pros**: zero extra build step, easy to update source.
+**Cons**: requires the venv present alongside the script; not portable to
+another machine without Python.
+
+To make it launchable from anywhere, symlink into `~/bin/`:
+```bash
+mkdir -p ~/bin
+ln -sf /home/opi/Programming/dict-anki/dict-anki ~/bin/dict-anki
+# ensure ~/bin is on PATH in ~/.bashrc / ~/.zshrc
+```
+
+#### Option B — PyInstaller standalone bundle
+Produces a directory (or single binary) with Python and all dependencies
+bundled — works on any Linux machine with compatible glibc.
+
+```bash
+venv/bin/pip install pyinstaller
+venv/bin/pyinstaller \
+    --name dict-anki \
+    --windowed \
+    --onedir \
+    --collect-all PyQt6 \
+    --hidden-import gtts \
+    app.py
+# Output: dist/dict-anki/dict-anki
+```
+
+Single-file variant (slower startup, simpler distribution):
+```bash
+venv/bin/pyinstaller --name dict-anki --windowed --onefile \
+    --collect-all PyQt6 --hidden-import gtts app.py
+# Output: dist/dict-anki
+```
+
+---
+
+### Windows
+
+Run on a **Windows machine** (cross-compilation is not supported by PyInstaller):
+
+```powershell
+python -m venv venv
+venv\Scripts\pip install -r requirements.txt
+venv\Scripts\pip install pyinstaller
+
+# Convert icon (requires ImageMagick)
+magick convert icon.png -resize 256x256 icon.ico
+
+venv\Scripts\pyinstaller `
+    --name dict-anki `
+    --windowed `
+    --onedir `
+    --icon icon.ico `
+    --collect-all PyQt6 `
+    --hidden-import gtts `
+    app.py
+```
+
+**Notes:**
+- `--windowed` suppresses the console window
+- `--collect-all PyQt6` is needed for `QMediaPlayer` audio DLLs
+- gTTS makes outbound HTTPS requests — Windows Defender may prompt on first run
+- Distribute the entire `dist\dict-anki\` folder, not just the `.exe`
+
+```
+dist\dict-anki\
+├── dict-anki.exe
+└── _internal\      # Qt DLLs, Python stdlib, site-packages
+```
+
+---
+
+## Known Quirks
+
+| Issue | Root cause | Fix applied |
+|---|---|---|
+| dict.cc returns only 3 results | Session not warmed up | `_get_session()` does a warm-up GET before the first search |
+| German vote count "6512" in word | `<div style="float:right">` inside `<td>` | All `<div>` children removed before `get_text()` |
+| Wiktionary returned empty | Missing `User-Agent` header | Added `headers={"User-Agent": "dict-anki/1.0"}` |
+| dict.cc audio broken / unreliable | URL pattern changed; content-type checks failed | Replaced entirely with gTTS; always generates audio from the formatted string |
+| Search slow | Wiktionary called serially for every noun before showing results | `SearchWorker` fetches dict.cc only; `PluralWorker` updates items in background |
+| Plural update lands on wrong row | Section headers interspersed in list shifted position-based index | Items store `result_idx` in UserRole; `_on_plural_updated` searches by it |
+
+---
+
+## Dependencies
+
+| Package | Version constraint | Purpose |
+|---|---|---|
+| `requests` | any | HTTP for dict.cc, Wiktionary, AnkiConnect |
+| `beautifulsoup4` | any | HTML parsing for dict.cc and Wiktionary |
+| `PyQt6` | ≥6.4 | GUI, threading, audio playback |
+| `gtts` | ≥2.3 | German TTS via Google Translate |
