@@ -216,6 +216,16 @@ Key behaviour:
   ` / table`.
 - **On open**: `ThumbnailLoader` and `AudioWorker` start in parallel
 - **Auto-play**: audio plays automatically as soon as `AudioWorker` emits `ready`
+- **⟳ Regenerate** (next to Play): re-runs TTS on the current text of the field
+  mapped to "German word" (e.g. `Front`), with `[sound:…]` tags stripped. It sets
+  `audio_text` to that text, so the audio filename changes. If the user edited that
+  field, `_sync_sound_tags()` rewrites its `[sound:…]` tag to the new file. Add to
+  Anki is disabled while regenerating, so stale audio can't be stored under the new name.
+- **Window width follows the fields**: field edits are `_FitLineEdit`s, whose size
+  hint is the full text width. `_fit_width()` sizes the dialog to fit them on open
+  and grows it (never shrinks it) whenever a field's text changes, capped at 90% of
+  the screen and kept on-screen. It measures the edits directly, because the
+  layouts' cached size hints lag behind `setText()`.
 - **Editable fields**: each mapped field is a `QLineEdit` pre-filled with
   the computed value:
   - `_field_edits: dict[str, QLineEdit]` — the widgets
@@ -384,8 +394,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
 What `build.ps1` does:
-1. Renders `icon.ico` by calling `app._render_icon_pixmap(256)` under
-   `QT_QPA_PLATFORM=offscreen` (no ImageMagick needed). The exe icon matches the in-app icon.
+1. Renders a multi-size `icon.ico` (16–256 px, PNG entries) with
+   `app._save_icon_ico()`, using the same drawing as the in-app window icon.
+   It must run on the **native** platform plugin. Under `QT_QPA_PLATFORM=offscreen`
+   there are no fonts, so ♾ renders as an empty box (this was the earlier wrong exe icon).
 2. Runs `python -m PyInstaller --windowed --onefile --icon icon.ico --name dict-anki app.py`.
 
 Set `$env:PYTHON` to use a specific interpreter (default: `python` on PATH).
@@ -417,6 +429,8 @@ Last built with Python 3.14.6, PyQt6 6.11.0, PyInstaller 6.22.3.
 | Search slow | Wiktionary called serially for every noun before showing results | `SearchWorker` fetches dict.cc only; Wiktionary lookup dropped (plural comes from the Word Info NOUN row) |
 | Extra ` / ` in preview English | Word Info rows carry `english = ""`, which was joined with the translation | Word Info + translations merge into one card; empty English values are skipped when joining |
 | Long German text overflowed preview | Fixed 15px header label | `_AutoFitLabel` shrinks font to fit, wraps below 9px |
+| Long Front value cut off in preview | Dialog stuck at minimum width | `_FitLineEdit` + `_fit_width()` grow the dialog to show the full field |
+| Exe icon was an empty box | Icon rendered under `offscreen` (no fonts) | `build.ps1` renders on the native platform |
 
 ---
 

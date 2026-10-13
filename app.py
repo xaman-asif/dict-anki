@@ -3,6 +3,8 @@
 import hashlib
 import os
 import pathlib
+import re
+import struct
 import sys
 import tempfile
 
@@ -14,7 +16,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QGroupBox, QSizePolicy,
     QScrollArea, QButtonGroup, QToolButton, QFrame,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize, QBuffer, QIODevice
 from PyQt6.QtGui import QPixmap, QIcon, QPainter, QFont, QFontMetrics, QBrush, QColor
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
@@ -186,6 +188,29 @@ def _audio_filename_for(text: str) -> str:
     return f"google-{h[:8]}-{h[8:16]}-{h[16:24]}-{h[24:32]}-{h[32:40]}.mp3"
 
 
+_SOUND_TAG_RE = re.compile(r"\s*\[sound:[^\]]*\]")
+
+
+def _strip_sound_tags(text: str) -> str:
+    return _SOUND_TAG_RE.sub("", text).strip()
+
+
+class _FitLineEdit(QLineEdit):
+    """Line edit whose size hint is wide enough to show its whole text,
+    so the dialog can grow to fit long values."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.textChanged.connect(self.updateGeometry)
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        m = self.textMargins()
+        # + padding/border/frame from the stylesheet and room for the cursor
+        w = self.fontMetrics().horizontalAdvance(self.text()) + m.left() + m.right() + 24
+        return QSize(max(hint.width(), w), hint.height())
+
+
 # ── Worker threads ────────────────────────────────────────────────────────────
 
 class SearchWorker(QThread):
@@ -271,6 +296,9 @@ class PreviewDialog(QDialog):
         self._player.setAudioOutput(self._aout)
 
         self._build_ui()
+        self._fit_width(initial=True)
+        for edit in self._field_edits.values():
+            edit.textChanged.connect(lambda _: self._fit_width())
         self._start_workers()
 
     # ── construction ──────────────────────────────────────────────────────
@@ -343,9 +371,16 @@ class PreviewDialog(QDialog):
         self._play_btn.setFixedWidth(90)
         self._play_btn.setEnabled(False)
         self._play_btn.clicked.connect(self._on_play)
+        self._regen_btn = QPushButton("⟳  Regenerate")
+        self._regen_btn.setMinimumHeight(30)
+        self._regen_btn.setToolTip("Regenerate audio from the German word field (e.g. Front)")
+        self._regen_btn.setEnabled(False)
+        self._regen_btn.clicked.connect(self._on_regenerate)
         self._audio_lbl = QLabel("Generating audio…")
         self._audio_lbl.setStyleSheet("color: #888; font-size: 11px;")
         audio_row.addWidget(self._play_btn)
+        audio_row.addSpacing(6)
+        audio_row.addWidget(self._regen_btn)
         audio_row.addSpacing(8)
         audio_row.addWidget(self._audio_lbl)
         audio_row.addStretch()
@@ -380,7 +415,7 @@ class PreviewDialog(QDialog):
         for field, mapping in self.field_mapping.items():
             if mapping == "Skip":
                 continue
-            edit = QLineEdit(self._field_value(mapping))
+            edit = _FitLineEdit(self._field_value(mapping))
             edit.setStyleSheet(
                 "font-family: monospace; font-size: 11px; color: #ce9178;"
                 "background: #2d2d2d; border: 1px solid #3c3c3c;"
@@ -421,6 +456,36 @@ class PreviewDialog(QDialog):
         bot.addWidget(self._add_btn)
         vbox.addLayout(bot)
 
+    def _fit_width(self, initial: bool = False):
+        """Grow (never shrink) the dialog so every field value is fully visible,
+        up to 90% of the screen width."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail  = screen.availableGeometry()
+        max_w  = int(avail.width() * 0.9)
+        if initial:
+            self.ensurePolished()  # apply stylesheet fonts before measuring text
+            hint = self.sizeHint()
+            self.resize(min(max(hint.width(), self.minimumWidth()), max_w),
+                        max(hint.height(), self.minimumHeight()))
+            return
+        # Widen by however much the most cramped field lacks. Measured on the
+        # edits directly: the layouts' cached size hints lag behind setText().
+        short = max((e.sizeHint().width() - e.width() for e in self._field_edits.values()),
+                    default=0)
+        want  = min(self.width() + short, max_w)
+        if want <= self.width():
+            return
+        # Grow symmetrically, then keep the window on screen.
+        g = self.geometry()
+        g.setLeft(g.left() - (want - g.width()) // 2)
+        g.setWidth(want)
+        frame = self.frameGeometry().width() - self.width()
+        if g.right() + frame > avail.right():
+            g.moveRight(avail.right() - frame)
+        if g.left() < avail.left():
+            g.moveLeft(avail.left())
+        self.setGeometry(g)
+
     # ── Workers ───────────────────────────────────────────────────────────
 
     def _start_workers(self):
@@ -428,7 +493,10 @@ class PreviewDialog(QDialog):
             self._thumb_worker = ThumbnailLoader(self.images)
             self._thumb_worker.ready.connect(self._on_thumbnail)
             self._thumb_worker.start()
+        self._start_audio_worker()
 
+    def _start_audio_worker(self):
+        self._regen_btn.setEnabled(False)
         self._audio_worker = AudioWorker(self.audio_text)
         self._audio_worker.ready.connect(self._on_audio_ready)
         self._audio_worker.error.connect(self._on_audio_error)
@@ -451,16 +519,57 @@ class PreviewDialog(QDialog):
         self._refresh_preview()
 
     def _on_audio_ready(self, data: bytes):
+        self._discard_tmp_audio()
         self._audio_data = data
         self._play_btn.setEnabled(True)
+        self._regen_btn.setEnabled(True)
+        self._add_btn.setEnabled(True)
         filename = _audio_filename_for(self.audio_text)
         self._audio_lbl.setText(f"✓  {filename}")
+        self._audio_lbl.setStyleSheet("color: #888; font-size: 11px;")
         self._refresh_preview()
+        self._sync_sound_tags()
         self._on_play()  # auto-play when audio is ready
 
     def _on_audio_error(self, msg: str):
+        self._regen_btn.setEnabled(True)
+        self._add_btn.setEnabled(True)
+        self._refresh_preview()
+        self._sync_sound_tags()
         self._audio_lbl.setText(f"⚠  {msg}")
         self._audio_lbl.setStyleSheet("color: #f48771; font-size: 11px;")
+
+    def _german_field_edit(self) -> QLineEdit | None:
+        for field, mapping in self.field_mapping.items():
+            if mapping == "German word" and field in self._field_edits:
+                return self._field_edits[field]
+        return None
+
+    def _on_regenerate(self):
+        """Re-run TTS on the current text of the German word field (e.g. Front)."""
+        edit = self._german_field_edit()
+        text = _strip_sound_tags(edit.text()) if edit else self.audio_text
+        if not text:
+            return
+        self.audio_text = text
+        self._audio_data = None
+        self._discard_tmp_audio()
+        self._play_btn.setEnabled(False)
+        self._add_btn.setEnabled(False)  # re-enabled once the new audio arrives
+        self._audio_lbl.setText("Generating audio…")
+        self._audio_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        self._start_audio_worker()
+
+    def _sync_sound_tags(self):
+        """Point the [sound:…] tag of user-edited German word / Audio fields at the
+        current audio file, or drop the tag if there is no audio (non-edited fields
+        are handled by _refresh_preview)."""
+        tag = f"[sound:{_audio_filename_for(self.audio_text)}]" if self._audio_data else ""
+        for field, mapping in self.field_mapping.items():
+            if field not in self._field_dirty or mapping not in ("German word", "Audio"):
+                continue
+            edit = self._field_edits[field]
+            edit.setText(" ".join(filter(None, [_strip_sound_tags(edit.text()), tag])))
 
     # ── Audio playback ────────────────────────────────────────────────────
 
@@ -474,6 +583,16 @@ class PreviewDialog(QDialog):
             self._tmp_audio = path
         self._player.setSource(QUrl.fromLocalFile(self._tmp_audio))
         self._player.play()
+
+    def _discard_tmp_audio(self):
+        self._player.stop()
+        self._player.setSource(QUrl())  # release the file handle before deleting
+        if self._tmp_audio and os.path.exists(self._tmp_audio):
+            try:
+                os.unlink(self._tmp_audio)
+            except Exception:
+                pass
+        self._tmp_audio = None
 
     # ── Field preview ─────────────────────────────────────────────────────
 
@@ -606,11 +725,7 @@ class PreviewDialog(QDialog):
             if w and w.isRunning():
                 w.quit()
                 w.wait(800)
-        if self._tmp_audio and os.path.exists(self._tmp_audio):
-            try:
-                os.unlink(self._tmp_audio)
-            except Exception:
-                pass
+        self._discard_tmp_audio()
         super().closeEvent(event)
 
 
@@ -946,6 +1061,29 @@ def _render_icon_pixmap(size: int = 256) -> QPixmap:
     p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "♾")
     p.end()
     return px
+
+
+def _save_icon_ico(path: str, sizes=(16, 20, 24, 32, 40, 48, 64, 128, 256)):
+    """Write the app icon as a multi-resolution .ico (PNG-compressed entries).
+    Must run on the native platform plugin — under 'offscreen' there are no
+    fonts and ♾ renders as an empty box."""
+    base = _render_icon_pixmap(256)
+    blobs = []
+    for s in sizes:
+        px = base if s == 256 else base.scaled(
+            s, s, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        px.save(buf, "PNG")
+        blobs.append((s, bytes(buf.data())))
+    out = struct.pack("<HHH", 0, 1, len(blobs))
+    offset = 6 + 16 * len(blobs)
+    for s, data in blobs:
+        out += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    with open(path, "wb") as fh:
+        fh.write(out + b"".join(d for _, d in blobs))
 
 
 def _install_app_icon(px: QPixmap):
