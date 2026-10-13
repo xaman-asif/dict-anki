@@ -21,12 +21,11 @@ from PyQt6.QtGui import QPixmap, QIcon, QPainter, QFont, QFontMetrics, QBrush, Q
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from dict_anki import (
-    fetch_search, format_german, GENDER_ARTICLE,
+    fetch_search, format_german,
     anki, load_config, save_config, tts_audio, store_anki_media,
 )
 
-# "German word" now embeds [sound:...] in the field value, same field.
-# "Audio" still available for a standalone sound-only field.
+# "German word" embeds [sound:...] after the text; "Audio" is a sound-only field.
 FIELD_OPTIONS = ["German word", "English translation", "Image", "Audio", "Skip"]
 
 APP_STYLE = """
@@ -948,7 +947,7 @@ class MainWindow(QMainWindow):
         if results:
             self.results_list.addItem(_make_section_header("Translations"))
             for idx, r in enumerate(results):
-                german  = format_german(r["german_word"], r["gender"], None)
+                german  = format_german(r["german_word"], r["gender"])
                 english = r["english"]
                 item = QListWidgetItem(f"  {german}  →  {english}")
                 item.setData(Qt.ItemDataRole.UserRole, {

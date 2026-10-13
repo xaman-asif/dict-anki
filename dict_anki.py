@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backend — dict.cc search, Wiktionary plural lookup, Anki integration."""
+"""Backend — dict.cc search, gTTS audio, Anki integration."""
 import re
 import json
 import base64
@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 ANKI_URL    = "http://localhost:8765"
 CONFIG_PATH = Path.home() / ".dict_anki.json"
 DICT_CC_URL = "https://www.dict.cc/"
-AUDIO_URL   = "https://audio.dict.cc/speak.audio.v2.php"
 
 GENDER_ARTICLE = {"m": "der", "f": "die", "n": "das"}
 
@@ -73,10 +72,9 @@ def save_config(config: dict):
 def fetch_search(word: str) -> dict:
     """
     Fetch dict.cc and return:
-      results   – list of {german_word, english, gender, entry_id}
+      results   – list of {german_word, english, gender}
+      word_info – list of {type, content}
       images    – list of {id, description, url}
-      audio_id  – int entry ID for German audio (or None)
-      audio_word – the searched word (for TTS fallback)
     """
     r = _get_session().get(DICT_CC_URL, params={"s": word}, timeout=10)
     r.raise_for_status()
@@ -85,8 +83,6 @@ def fetch_search(word: str) -> dict:
         "results":   _parse_results(html, word),
         "word_info": _extract_word_info(html),
         "images":    _extract_images(html),
-        "audio_id":  _find_audio_id(html, word),
-        "audio_word": word,
     }
 
 
@@ -99,23 +95,11 @@ def _extract_string_arr(html: str, name: str) -> list[str]:
     return [s.replace("\\'", "'") for s in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))]
 
 
-def _extract_int_arr(html: str, name: str) -> list[int]:
-    """Parse a JS integer array, e.g. var idArr = new Array(0,123,456);"""
-    m = re.search(rf'var {name}\s*=\s*new Array\(([^)]+)\)', html)
-    if not m:
-        return []
-    try:
-        return [int(x.strip()) for x in m.group(1).split(",")]
-    except ValueError:
-        return []
-
-
 def _parse_results(html: str, word: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
 
-    # JS arrays: c1[0]="" c1[1]=first English; ids[0]=0 ids[1]=first entry ID
-    c1  = _extract_string_arr(html, "c1Arr")
-    ids = _extract_int_arr(html, "idArr")
+    # JS array: c1[0]="" c1[1]=first English
+    c1 = _extract_string_arr(html, "c1Arr")
 
     results = []
     for tr in soup.find_all("tr", id=re.compile(r"^tr\d+")):
@@ -152,7 +136,6 @@ def _parse_results(html: str, word: str) -> list[dict]:
             "german_word": de,
             "english":     en,
             "gender":      gender,
-            "entry_id":    ids[row] if row < len(ids) else None,
         })
 
     return _sort_results(results, word)
@@ -230,54 +213,12 @@ def _extract_images(html: str) -> list[dict]:
     return images
 
 
-def _find_audio_id(html: str, word: str) -> int | None:
-    """Return the dict.cc entry ID for the exact German word (for audio URL)."""
-    c2  = _extract_string_arr(html, "c2Arr")
-    ids = _extract_int_arr(html, "idArr")
-    q   = word.lower()
-    for idx in range(1, min(len(c2), len(ids))):
-        if c2[idx].lower() == q and ids[idx]:
-            return ids[idx]
-    return None
-
-
-# ── Wiktionary plural ─────────────────────────────────────────────────────────
-
-def get_plural(word: str) -> str | None:
-    try:
-        r = requests.get(
-            "https://en.wiktionary.org/w/api.php",
-            params={
-                "action": "parse", "page": word, "prop": "text",
-                "format": "json", "formatversion": "2",
-            },
-            timeout=5,
-            headers={"User-Agent": "dict-anki/1.0"},
-        )
-        html = r.json().get("parse", {}).get("text", "")
-    except Exception:
-        return None
-
-    soup  = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", class_=re.compile(r"inflection-table-de"))
-    if not table:
-        return None
-
-    for tr in table.find_all("tr"):
-        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-        if cells and cells[0].lower() == "nominative" and len(cells) >= 6:
-            return re.sub(r"\d+$", "", cells[5]).strip() or None
-    return None
-
-
 # ── Format ────────────────────────────────────────────────────────────────────
 
-def format_german(word: str, gender: str | None, plural: str | None) -> str:
+def format_german(word: str, gender: str | None) -> str:
     article = GENDER_ARTICLE.get(gender or "")
     if gender == "pl":
         return f"die {word}"
-    if article and plural:
-        return f"{article} {word} | die {plural}"
     if article:
         return f"{article} {word}"
     return word
