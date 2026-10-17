@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """PyQt6 GUI — dict.cc → Anki flashcard maker."""
+import difflib
 import hashlib
 import os
 import pathlib
@@ -7,6 +8,7 @@ import re
 import struct
 import sys
 import tempfile
+import unicodedata
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QDialog, QWidget,
@@ -14,10 +16,13 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem,
     QComboBox, QGroupBox, QSizePolicy,
-    QScrollArea, QButtonGroup, QToolButton, QFrame,
+    QScrollArea, QButtonGroup, QToolButton, QFrame, QMenu,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize, QBuffer, QIODevice
-from PyQt6.QtGui import QPixmap, QIcon, QPainter, QFont, QFontMetrics, QBrush, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize, QBuffer, QIODevice, QEvent
+from PyQt6.QtGui import (
+    QPixmap, QImage, QIcon, QPainter, QFont, QFontMetrics, QBrush, QColor,
+    QShortcut, QKeySequence,
+)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from dict_anki import (
@@ -116,6 +121,10 @@ APP_STYLE = """
     }
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     QLabel { color: #d4d4d4; }
+    QMenu { background-color: #252526; border: 1px solid #3c3c3c; padding: 4px 0; }
+    QMenu::item { padding: 5px 24px; }
+    QMenu::item:selected { background-color: #094771; color: #ffffff; }
+    QMenu::item:disabled { color: #555555; }
 """
 
 _IMG_BTN_STYLE = """
@@ -192,6 +201,65 @@ _SOUND_TAG_RE = re.compile(r"\s*\[sound:[^\]]*\]")
 
 def _strip_sound_tags(text: str) -> str:
     return _SOUND_TAG_RE.sub("", text).strip()
+
+
+def _fold(text: str) -> str:
+    """Lowercase and drop accents so 'tur' matches 'Tür'; ß → ss."""
+    text = unicodedata.normalize("NFKD", text.casefold().replace("ß", "ss"))
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+def _fuzzy_token_score(tok: str, text: str) -> float | None:
+    """Score one query token against folded text; None = no match.
+    Substring > in-order letters (e.g. 'tsch' in 'tisch') > close typo ('tabel')."""
+    pos = text.find(tok)
+    if pos >= 0:
+        at_word_start = pos == 0 or not text[pos - 1].isalnum()
+        end = pos + len(tok)
+        whole_word = at_word_start and (end == len(text) or not text[end].isalnum())
+        return 100 + 20 * at_word_start + 30 * whole_word
+
+    words = re.findall(r"\w+", text)
+
+    # Letters in order within one word; fewer gaps score higher
+    best = None
+    for word in words:
+        i, last, gaps = 0, -1, 0
+        for j, c in enumerate(word):
+            if i < len(tok) and c == tok[i]:
+                gaps += j - last - 1 if last >= 0 else 0
+                last, i = j, i + 1
+        if i == len(tok):
+            best = max(best or 0, 90 - 5 * gaps)
+    if best is not None:
+        return max(40, best)
+
+    # Typo tolerance against each word (and the same-length prefix of each word)
+    if len(tok) >= 3:
+        ratio = max((difflib.SequenceMatcher(None, tok, cand).ratio()
+                     for word in words for cand in (word, word[:len(tok)])), default=0)
+        if ratio >= 0.75:
+            return 30 * ratio
+    return None
+
+
+def _fuzzy_score(query: str, text: str) -> float | None:
+    """Every whitespace-separated token in the query must match."""
+    tokens = _fold(query).split()
+    if not tokens:
+        return None
+    text = _fold(text)
+    total = 0.0
+    for tok in tokens:
+        sc = _fuzzy_token_score(tok, text)
+        if sc is None:
+            return None
+        total += sc
+    return total
+
+
+_ORDER_ROLE = Qt.ItemDataRole.UserRole + 1   # original position, to restore order
+_COLOR_ROLE = Qt.ItemDataRole.UserRole + 2   # original ForegroundRole (None = default), to undo dimming
 
 
 class _FitLineEdit(QLineEdit):
@@ -344,6 +412,9 @@ class PreviewDialog(QDialog):
                 btn.setToolTip(img.get("description", ""))
                 btn.setText("…")
                 btn.setStyleSheet(_IMG_BTN_STYLE)
+                btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda pos, i=idx: self._on_img_context_menu(i, pos))
                 self._img_group.addButton(btn, idx)
                 hlay.addWidget(btn)
                 self._img_btns.append(btn)
@@ -516,6 +587,21 @@ class PreviewDialog(QDialog):
         if idx < len(self.images):
             self._img_caption.setText(self.images[idx].get("description", ""))
         self._refresh_preview()
+
+    def _on_img_context_menu(self, idx: int, pos):
+        menu = QMenu(self)
+        copy = menu.addAction("Copy")
+        copy.setEnabled(self._img_data[idx] is not None)  # thumbnail not loaded yet
+        copy.triggered.connect(lambda: self._copy_image(idx))
+        menu.exec(self._img_btns[idx].mapToGlobal(pos))
+
+    def _copy_image(self, idx: int):
+        img = QImage.fromData(self._img_data[idx])
+        if img.isNull():
+            self._status_lbl.setText("Couldn't copy image")
+            return
+        QApplication.clipboard().setImage(img)
+        self._status_lbl.setText("Image copied")
 
     def _on_audio_ready(self, data: bytes):
         self._discard_tmp_audio()
@@ -777,6 +863,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._populate_anki()
 
+        QShortcut(QKeySequence.StandardKey.Find, self, activated=self._show_filter)
+
     # ── UI ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -805,6 +893,19 @@ class MainWindow(QMainWindow):
         self.results_list.setSpacing(1)
         self.results_list.itemChanged.connect(self._refresh_btn)
         vbox.addWidget(self.results_list)
+
+        # Ctrl+F filter box, floating over the list's top-right corner
+        self._filter_edit = QLineEdit(self.results_list)
+        self._filter_edit.setPlaceholderText("Filter…")
+        self._filter_edit.setFixedWidth(200)
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.setStyleSheet(
+            "QLineEdit { background-color: #252526; border: 1px solid #0078d4; }")
+        self._filter_edit.hide()
+        self._filter_edit.textChanged.connect(self._apply_filter)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self._filter_edit,
+                  context=Qt.ShortcutContext.WidgetShortcut, activated=self._hide_filter)
+        self.results_list.viewport().installEventFilter(self)
 
         anki_box = QGroupBox("Anki")
         af = QFormLayout(anki_box)
@@ -848,6 +949,73 @@ class MainWindow(QMainWindow):
         bot.addWidget(self.status_lbl, 1)
         bot.addWidget(self.preview_btn)
         vbox.addLayout(bot)
+
+    # ── Results filter (Ctrl+F) ───────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        # The viewport resizes with the window and when the scrollbar appears
+        if obj is self.results_list.viewport() and event.type() == QEvent.Type.Resize:
+            self._place_filter()
+        return super().eventFilter(obj, event)
+
+    def _place_filter(self):
+        vp = self.results_list.viewport().geometry()
+        self._filter_edit.move(vp.right() - self._filter_edit.width() - 5, vp.top() + 5)
+
+    def _show_filter(self):
+        self._place_filter()
+        self._filter_edit.show()
+        self._filter_edit.raise_()
+        self._filter_edit.setFocus()
+        self._filter_edit.selectAll()
+
+    def _hide_filter_for_new_results(self):
+        # Keep keyboard focus in the search box while typing a new word
+        self._filter_edit.blockSignals(True)
+        self._filter_edit.clear()
+        self._filter_edit.blockSignals(False)
+        self._filter_edit.hide()
+
+    def _hide_filter(self):
+        self._filter_edit.clear()   # restores the original order
+        self._filter_edit.hide()
+        self.results_list.setFocus()
+
+    def _apply_filter(self):
+        """Within each section, move fuzzy matches to the top (best first) and dim
+        the rest. Items are moved, not rebuilt, so check states survive."""
+        query = self._filter_edit.text()
+        lst   = self.results_list
+        items = [lst.takeItem(0) for _ in range(lst.count())]
+
+        def score(item):
+            d = item.data(Qt.ItemDataRole.UserRole)
+            return _fuzzy_score(query, f"{d['german']} {d['english']}") if query.strip() else None
+
+        ordered, section = [], []
+        def flush():
+            scored = [(score(it), it) for it in section]
+            scored.sort(key=lambda p: (p[0] is None, -(p[0] or 0), p[1].data(_ORDER_ROLE)))
+            for sc, it in scored:
+                dim = bool(query.strip()) and sc is None
+                it.setData(Qt.ItemDataRole.ForegroundRole,
+                           QBrush(QColor("#5a5a5a")) if dim else it.data(_COLOR_ROLE))
+                ordered.append(it)
+            section.clear()
+
+        for it in items:
+            if it.data(Qt.ItemDataRole.UserRole) is None:   # section header stays put
+                flush()
+                ordered.append(it)
+            else:
+                section.append(it)
+        flush()
+
+        lst.blockSignals(True)
+        for it in ordered:
+            lst.addItem(it)
+        lst.blockSignals(False)
+        lst.scrollToTop()
 
     # ── Anki ──────────────────────────────────────────────────────────────
 
@@ -902,6 +1070,7 @@ class MainWindow(QMainWindow):
         else:
             self._debounce.stop()
             self._stop_workers()
+            self._hide_filter_for_new_results()
             self.results_list.clear()
             self._search_data = {}
             self._set_status("")
@@ -917,6 +1086,7 @@ class MainWindow(QMainWindow):
         if not word:
             return
         self._stop_workers()
+        self._hide_filter_for_new_results()
         self.results_list.clear()
         self._search_data = {}
         self._refresh_btn()
@@ -943,7 +1113,6 @@ class MainWindow(QMainWindow):
             for wi in word_info:
                 self.results_list.addItem(_make_word_info_item(wi["type"], wi["content"]))
 
-        first_checked = False
         if results:
             self.results_list.addItem(_make_section_header("Translations"))
             for idx, r in enumerate(results):
@@ -954,14 +1123,16 @@ class MainWindow(QMainWindow):
                     "german": german, "english": english, "result_idx": idx,
                 })
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.CheckState.Checked if not first_checked
-                    else Qt.CheckState.Unchecked
-                )
-                first_checked = True
+                item.setCheckState(Qt.CheckState.Unchecked)
                 self.results_list.addItem(item)
 
+        for i in range(self.results_list.count()):
+            item = self.results_list.item(i)
+            item.setData(_ORDER_ROLE, i)
+            item.setData(_COLOR_ROLE, item.data(Qt.ItemDataRole.ForegroundRole))
         self.results_list.blockSignals(False)
+        if self._filter_edit.text().strip():   # filter typed while the search ran
+            self._apply_filter()
         self._refresh_btn()
 
         n         = len(results)

@@ -10,7 +10,7 @@ to Anki via AnkiConnect.
 |---|---|
 | `app.py` | GUI: main window, preview dialog, worker threads, app icon |
 | `dict_anki.py` | Backend: dict.cc scraping, gTTS, AnkiConnect, config |
-| `build.py` | Builds a one-file executable and registers it with the desktop (Linux/Windows) |
+| `install.py` | Installs a one-file executable and registers it with the desktop (Linux/Windows) |
 
 ## Running
 
@@ -25,7 +25,7 @@ venv/bin/python app.py
 ## Building
 
 ```bash
-python build.py
+python install.py
 ```
 
 - Uses `$PYTHON`, else `venv/`'s Python, else the current one; installs
@@ -72,10 +72,18 @@ Network calls run in `QThread`s: `SearchWorker` (dict.cc), `ThumbnailLoader`
 ### Main window
 
 - Live search: ≥2 characters, 600 ms debounce.
-- Results list has two sections: **Word Info** (unchecked) and **Translations**
-  (first one checked). Checkable rows store `{german, english, result_idx}` in
+- Results list has two sections: **Word Info** and **Translations**, all rows
+  unchecked. Checkable rows store `{german, english, result_idx}` in
   `UserRole`; Word Info rows have `result_idx = None`, `english = ""`. Section
   headers have no `UserRole` data.
+- **Ctrl+F** opens a filter box over the list's top-right corner. Within each
+  section, rows matching `german + english` move to the top (best first) and the
+  rest are dimmed; Esc or a new search restores the original order. Rows are moved,
+  not rebuilt, so check states survive. Matching (`_fuzzy_score`) ignores case,
+  umlauts and ß, and every query word must match, as a substring, as in-order
+  letters within one word (`tsch` → Tisch), or as a close typo (`tabel` → table).
+  Because rows move, "first checked Word Info row" in `_open_preview` means first
+  in the current order.
 - Each Anki note field is mapped to one of: German word, English translation,
   Image, Audio, Skip.
 
@@ -89,6 +97,8 @@ Checked rows → cards (`_open_preview`):
 ### Preview dialog
 
 - Starts thumbnail loading and TTS on open; audio auto-plays when ready.
+- Right-click a thumbnail → **Copy** puts the image on the clipboard
+  (disabled until that thumbnail has loaded).
 - Every mapped field is an editable line edit. Fields the user typed in are
   "dirty" and never auto-overwritten (by audio arriving or image selection).
 - "German word" field embeds the audio: `der Tisch [sound:google-….mp3]`.
