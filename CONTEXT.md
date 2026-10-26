@@ -33,7 +33,8 @@ python install.py
 - Runs PyInstaller `--onefile --windowed` → `dist/dict-anki` or `dist\dict-anki.exe`.
 - **Linux**: installs the icon PNG and `~/.local/share/applications/dict-anki.desktop`
   (`Exec=` → `dist/dict-anki`). **Windows**: `dict.cc → Anki` shortcuts on the
-  Desktop and in the Start Menu.
+  Desktop and in the Start Menu. WScript.Shell's `Save()` turns `→` into an
+  invalid `?`, so each `.lnk` is saved under an ASCII temp name and moved into place.
 - Entries point into `dist/`: rebuild after source changes, rerun after moving the project.
 - PyInstaller can't cross-compile — build on the target OS.
 
@@ -84,6 +85,10 @@ Network calls run in `QThread`s: `SearchWorker` (dict.cc), `ThumbnailLoader`
   letters within one word (`tsch` → Tisch), or as a close typo (`tabel` → table).
   Because rows move, "first checked Word Info row" in `_open_preview` means first
   in the current order.
+- **Copy**: Ctrl+C copies the checked rows, one per line in the current order,
+  or the current row when nothing is checked. Right-click offers **Copy checked**
+  and **Copy this row**. Translations copy as `der Tisch → table`, Word Info rows
+  as their content only.
 - Each Anki note field is mapped to one of: German word, English translation,
   Image, Audio, Skip.
 

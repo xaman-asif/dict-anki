@@ -845,6 +845,12 @@ def _make_word_info_item(label: str, content: str) -> QListWidgetItem:
     return item
 
 
+def _row_copy_text(stored: dict) -> str:
+    """Clipboard text for a checkable results row: `german → english`, or just
+    the German side for Word Info rows (which have no English)."""
+    return f"{stored['german']} → {stored['english']}" if stored["english"] else stored["german"]
+
+
 # ── Main Window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -892,6 +898,9 @@ class MainWindow(QMainWindow):
         self.results_list.setAlternatingRowColors(True)
         self.results_list.setSpacing(1)
         self.results_list.itemChanged.connect(self._refresh_btn)
+        self.results_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results_list.customContextMenuRequested.connect(self._on_results_context_menu)
+        self.results_list.installEventFilter(self)   # Ctrl+C
         vbox.addWidget(self.results_list)
 
         # Ctrl+F filter box, floating over the list's top-right corner
@@ -956,6 +965,12 @@ class MainWindow(QMainWindow):
         # The viewport resizes with the window and when the scrollbar appears
         if obj is self.results_list.viewport() and event.type() == QEvent.Type.Resize:
             self._place_filter()
+        # Replaces QListWidget's own Ctrl+C, which copies the raw display text
+        # of the current row only
+        elif (obj is self.results_list and event.type() == QEvent.Type.KeyPress
+              and event.matches(QKeySequence.StandardKey.Copy)):
+            self._copy_rows(self._checked_items() or [self.results_list.currentItem()])
+            return True
         return super().eventFilter(obj, event)
 
     def _place_filter(self):
@@ -1016,6 +1031,29 @@ class MainWindow(QMainWindow):
             lst.addItem(it)
         lst.blockSignals(False)
         lst.scrollToTop()
+
+    # ── Copy (right-click / Ctrl+C) ───────────────────────────────────────
+
+    def _on_results_context_menu(self, pos):
+        checked = self._checked_items()
+        item    = self.results_list.itemAt(pos)
+        menu    = QMenu(self)
+        copy_checked = menu.addAction(f"Copy checked ({len(checked)})" if checked else "Copy checked")
+        copy_checked.setEnabled(bool(checked))
+        copy_checked.triggered.connect(lambda: self._copy_rows(checked))
+        if item is not None and item.data(Qt.ItemDataRole.UserRole):   # not a section header
+            menu.addAction("Copy this row").triggered.connect(lambda: self._copy_rows([item]))
+        # QAbstractScrollArea reports the position in viewport coordinates
+        menu.exec(self.results_list.viewport().mapToGlobal(pos))
+
+    def _copy_rows(self, items: list):
+        """One line per row, in the list's current order."""
+        lines = [_row_copy_text(it.data(Qt.ItemDataRole.UserRole))
+                 for it in items if it is not None and it.data(Qt.ItemDataRole.UserRole)]
+        if not lines:
+            return
+        QApplication.clipboard().setText("\n".join(lines))
+        self._set_status(f"Copied {len(lines)} row{'s' if len(lines) != 1 else ''}")
 
     # ── Anki ──────────────────────────────────────────────────────────────
 
@@ -1146,16 +1184,20 @@ class MainWindow(QMainWindow):
 
     # ── Preview ───────────────────────────────────────────────────────────
 
+    def _checked_items(self) -> list[QListWidgetItem]:
+        """Checked rows (never section headers), in the list's current order."""
+        lst = self.results_list
+        return [it for it in (lst.item(i) for i in range(lst.count()))
+                if it.data(Qt.ItemDataRole.UserRole) and it.checkState() == Qt.CheckState.Checked]
+
     def _open_preview(self):
         word_infos, translations = [], []
-        for i in range(self.results_list.count()):
-            item = self.results_list.item(i)
+        for item in self._checked_items():
             stored = item.data(Qt.ItemDataRole.UserRole)
-            if stored and item.checkState() == Qt.CheckState.Checked:
-                if stored["result_idx"] is None:
-                    word_infos.append(stored)
-                else:
-                    translations.append(stored)
+            if stored["result_idx"] is None:
+                word_infos.append(stored)
+            else:
+                translations.append(stored)
         if not word_infos and not translations:
             return
 
@@ -1196,13 +1238,7 @@ class MainWindow(QMainWindow):
             self._refresh_btn()
 
     def _refresh_btn(self):
-        has_checked = False
-        for i in range(self.results_list.count()):
-            item = self.results_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) and item.checkState() == Qt.CheckState.Checked:
-                has_checked = True
-                break
-        self.preview_btn.setEnabled(has_checked and bool(self.deck_combo.currentText()))
+        self.preview_btn.setEnabled(bool(self._checked_items()) and bool(self.deck_combo.currentText()))
 
     def _set_status(self, msg: str):
         self.status_lbl.setText(msg)

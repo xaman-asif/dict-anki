@@ -111,19 +111,25 @@ def install_windows_shortcuts(exe: Path):
     def q(s) -> str:  # PowerShell single-quoted string literal
         return "'" + str(s).replace("'", "''") + "'"
 
-    # WScript.Shell creates .lnk files; GetFolderPath follows OneDrive redirection
+    # WScript.Shell creates .lnk files; GetFolderPath follows OneDrive redirection.
+    # Its Save() converts the path to the ANSI code page, so the → in the name
+    # becomes an invalid "?". Save under an ASCII name, then let PowerShell
+    # (full Unicode) move it into place.
     ps = f"""
 $ErrorActionPreference = 'Stop'
 $shell = New-Object -ComObject WScript.Shell
+$tmp = Join-Path ([IO.Path]::GetTempPath()) {q(NAME + '.lnk')}
 foreach ($d in @([Environment]::GetFolderPath('Desktop'),
                  [Environment]::GetFolderPath('Programs'))) {{
-    $lnk = $shell.CreateShortcut((Join-Path $d {q(DISPLAY_NAME + '.lnk')}))
+    $lnk = $shell.CreateShortcut($tmp)
     $lnk.TargetPath = {q(exe)}
     $lnk.WorkingDirectory = {q(exe.parent)}
     $lnk.IconLocation = {q(f'{exe},0')}
     $lnk.Description = {q(COMMENT)}
     $lnk.Save()
-    Write-Host "Shortcut: $($lnk.FullName)"
+    $dest = Join-Path $d {q(DISPLAY_NAME + '.lnk')}
+    Move-Item -LiteralPath $tmp -Destination $dest -Force
+    Write-Host "Shortcut: $dest"
 }}
 """
     run("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
